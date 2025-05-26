@@ -21,8 +21,8 @@ LEVERAGE            = int(os.getenv("LEVERAGE", 5))
 
 # ─── CCXT Hyperliquid Client ─────────────────────────────────────────────────
 exchange = ccxt.hyperliquid({
-    "account_address": WALLET_ADDRESS,
-    "secret":          HYPE_API_SECRET,
+    "walletAddress": WALLET_ADDRESS,
+    "privateKey":          HYPE_API_SECRET,
     "enableRateLimit": True,
 })
 
@@ -68,8 +68,8 @@ async def global_exception_handler(request: Request, exc: Exception):
 # ─── Helper: Fetch Perpetual USDC Balances ────────────────────────────────────
 async def get_perp_usdc():
     # params: type='swap' for perpetuals, user=your wallet address
-    params = {"type": "swap", "user": WALLET_ADDRESS}
-    resp = await exchange.fetch_balance(params)
+    resp = await exchange.fetch_balance()
+    notify_discord(resp)
     for bal in resp.get("balances", []):
         if bal.get("coin") == "USDC":
             total = float(bal.get("total", 0))

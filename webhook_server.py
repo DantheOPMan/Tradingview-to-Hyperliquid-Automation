@@ -1,7 +1,9 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-import os, sys, json
+import os
+import sys
+import json
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 import ccxt.async_support as ccxt
@@ -10,17 +12,17 @@ import httpx
 app = FastAPI()
 
 # ─── Environment Variables ────────────────────────────────────────────────────
-TRADINGVIEW_SECRET   = os.getenv("TRADINGVIEW_SECRET")
-HYPE_API_SECRET      = os.getenv("HYPE_API_SECRET")
-DISCORD_WEBHOOK_URL  = os.getenv("DISCORD_WEBHOOK_URL")
-WALLET_ADDRESS       = os.getenv("WALLET_ADDRESS")       # your API‐wallet address
-DEFAULT_SYMBOL       = os.getenv("SYMBOL", "BTC/USDC:USDC")
-LEVERAGE             = int(os.getenv("LEVERAGE", 5))
+TRADINGVIEW_SECRET  = os.getenv("TRADINGVIEW_SECRET")
+HYPE_API_SECRET     = os.getenv("HYPE_API_SECRET")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+WALLET_ADDRESS      = os.getenv("WALLET_ADDRESS")           # your API‑wallet address
+DEFAULT_SYMBOL      = os.getenv("SYMBOL", "BTC/USDC:USDC")
+LEVERAGE            = int(os.getenv("LEVERAGE", 5))
 
 # ─── CCXT Hyperliquid Client ─────────────────────────────────────────────────
 exchange = ccxt.hyperliquid({
-    "apiKey":        WALLET_ADDRESS,
-    "secret":        HYPE_API_SECRET,
+    "apiKey":          WALLET_ADDRESS,
+    "secret":          HYPE_API_SECRET,
     "enableRateLimit": True,
 })
 
@@ -65,15 +67,13 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 # ─── Helper: Fetch Perpetual USDC Balances ────────────────────────────────────
 async def get_perp_usdc():
-    params = {
-        "type": "swap",          # perpetual trades
-        "user": WALLET_ADDRESS,  # your API‐wallet address
-    }
+    # params: type='swap' for perpetuals, user=your wallet address
+    params = {"type": "swap", "user": WALLET_ADDRESS}
     resp = await exchange.fetch_balance(params)
     for bal in resp.get("balances", []):
-        if bal["coin"] == "USDC":
-            total = float(bal["total"])
-            hold  = float(bal["hold"])
+        if bal.get("coin") == "USDC":
+            total = float(bal.get("total", 0))
+            hold  = float(bal.get("hold", 0))
             free  = total - hold
             return {"total": total, "hold": hold, "free": free}
     return {"total": 0.0, "hold": 0.0, "free": 0.0}
@@ -82,17 +82,19 @@ async def get_perp_usdc():
 @app.post("/webhook")
 async def handle_webhook(req: Request):
     data = await req.json()
+
+    # 1) Authenticate
     if data.get("secret") != TRADINGVIEW_SECRET:
         raise HTTPException(401, "Invalid secret")
 
     action = data.get("action", "").upper()
     symbol = data.get("symbol", DEFAULT_SYMBOL)
 
-    # fetch current price for notifications
+    # 2) Fetch current price
     ticker = await exchange.fetch_ticker(symbol)
     price  = ticker["last"]
 
-    # ——— Close Positions (FLAT) ——————————————————————————————
+    # 3) Handle FLAT (close any open position)
     if action == "FLAT":
         positions = await exchange.fetch_positions()
         for pos in positions:
@@ -107,11 +109,11 @@ async def handle_webhook(req: Request):
         await notify_discord(f"{symbol} FLAT {price:.2f}")
         return {"status": "no_position"}
 
-    # ——— Validate Action ————————————————————————————————————
+    # 4) Validate action
     if action not in ("BUY", "SELL"):
         raise HTTPException(400, f"Unknown action: {action}")
 
-    # ——— Check Available USDC —————————————————————————————
+    # 5) Check free USDC for new trade
     usdc = await get_perp_usdc()
     if usdc["free"] <= 0:
         msg = (
@@ -121,17 +123,19 @@ async def handle_webhook(req: Request):
         await notify_discord(msg)
         raise HTTPException(400, f"Insufficient balance: {usdc['free']:.6f} USDC")
 
-    # ——— Place Market Order at 5× Leverage ——————————————————————
+    # 6) Compute position size (5× leverage)
     side   = "buy" if action == "BUY" else "sell"
     amount = (usdc["free"] * LEVERAGE) / price
 
+    # 7) Place market order
     try:
         order = await exchange.create_order(
-            symbol, "market", side, amount, None, {"leverage": LEVERAGE+1}
+            symbol, "market", side, amount, None, {"leverage": LEVERAGE}
         )
     except Exception as e:
         await notify_discord(f"{symbol} {action} {price:.2f} — failed: {e}")
         raise HTTPException(500, f"Order failed: {e}")
 
+    # 8) Success notification
     await notify_discord(f"{symbol} {action} {price:.2f}")
     return {"status": "ok", "action": action, "order": order}

@@ -57,6 +57,7 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     await notify_discord("🛑 Service is shutting down")
+    await exchange.close()
 
 # ─── Global Exception Handler ─────────────────────────────────────────────────
 @app.exception_handler(Exception)
@@ -67,43 +68,45 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 # ─── Helper: Fetch Perpetual USDC Balances ────────────────────────────────────
 async def get_perp_usdc():
-    # params: type='swap' for perpetuals, user=your wallet address
     resp = await exchange.fetch_balance()
-    notify_discord(resp)
-    for bal in resp.get("balances", []):
-        if bal.get("coin") == "USDC":
-            total = float(bal.get("total", 0))
-            hold  = float(bal.get("hold", 0))
-            free  = total - hold
-            return {"total": total, "hold": hold, "free": free}
-    return {"total": 0.0, "hold": 0.0, "free": 0.0}
+    balance = resp.get("USDC")
+    if balance:
+        total = float(balance.get("total", 0.0))
+        free  = float(balance.get("free",  0.0))
+        hold  = float(balance.get("used",  total - free))
+        return {"total": total, "hold": hold, "free": free}
+
+    free  = float(resp.get("free",  {}).get("USDC", 0.0))
+    used  = float(resp.get("used",  {}).get("USDC", 0.0))
+    total = float(resp.get("total", {}).get("USDC", free + used))
+    return {"total": total, "hold": used, "free": free}
+
 
 # ─── Main Webhook Endpoint ───────────────────────────────────────────────────
 @app.post("/webhook")
 async def handle_webhook(req: Request):
     data = await req.json()
 
-    # 1) Authenticate
     if data.get("secret") != TRADINGVIEW_SECRET:
         raise HTTPException(401, "Invalid secret")
 
     action = data.get("action", "").upper()
     symbol = data.get("symbol", DEFAULT_SYMBOL)
 
-    # 2) Fetch current price
     ticker = await exchange.fetch_ticker(symbol)
     price  = ticker["last"]
 
-    # 3) Handle FLAT (close any open position)
     if action == "FLAT":
         positions = await exchange.fetch_positions()
         for pos in positions:
-            if pos["symbol"] == symbol and pos["contractSize"] != 0:
-                amt        = abs(pos["contractSize"])
-                close_side = "sell" if pos["contractSize"] > 0 else "buy"
-                order      = await exchange.create_order(
-                    symbol, "market", close_side, amt, None, {"leverage": LEVERAGE}
-                )
+            if pos["symbol"] == symbol:
+                size_str = pos["info"]["position"]["szi"]
+                size = float(size_str)
+                if size == 0:
+                    continue
+                amt= abs(size)
+                close_side = "sell" if size > 0 else "buy"
+                order = await exchange.create_order(symbol,"market",close_side,amt,price,{"leverage": LEVERAGE,"reduceOnly": True,})
                 await notify_discord(f"{symbol} FLAT {price:.2f}")
                 return {"status": "closed", "order": order}
         await notify_discord(f"{symbol} FLAT {price:.2f}")
@@ -130,7 +133,7 @@ async def handle_webhook(req: Request):
     # 7) Place market order
     try:
         order = await exchange.create_order(
-            symbol, "market", side, amount, None, {"leverage": LEVERAGE}
+            symbol, "market", side, amount, price, {"leverage": LEVERAGE}
         )
     except Exception as e:
         await notify_discord(f"{symbol} {action} {price:.2f} — failed: {e}")

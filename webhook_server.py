@@ -14,13 +14,15 @@ TRADINGVIEW_SECRET   = os.getenv("TRADINGVIEW_SECRET")
 HYPE_API_KEY         = os.getenv("HYPE_API_KEY")
 HYPE_API_SECRET      = os.getenv("HYPE_API_SECRET")
 DISCORD_WEBHOOK_URL  = os.getenv("DISCORD_WEBHOOK_URL")
-DEFAULT_SYMBOL       = os.getenv("SYMBOL", "BTC/USD")
+WALLET_ADDRESS       = os.getenv("WALLET_ADDRESS")
+DEFAULT_SYMBOL       = os.getenv("SYMBOL", "BTC/USDC:USDC")
 LEVERAGE             = 5
 
-# CCXT client
+# CCXT client — note the walletAddress param
 exchange = ccxt.hyperliquid({
     "apiKey":          HYPE_API_KEY,
     "secret":          HYPE_API_SECRET,
+    "walletAddress":   WALLET_ADDRESS,
     "enableRateLimit": True,
 })
 
@@ -33,22 +35,20 @@ async def notify_discord(content: str):
 
 @app.on_event("startup")
 async def on_startup():
-    # 1) Validate env vars
+    # Validate env vars
     required = {
         "TRADINGVIEW_SECRET": TRADINGVIEW_SECRET,
         "HYPE_API_KEY":       HYPE_API_KEY,
         "HYPE_API_SECRET":    HYPE_API_SECRET,
         "DISCORD_WEBHOOK_URL":DISCORD_WEBHOOK_URL,
+        "WALLET_ADDRESS":     WALLET_ADDRESS,
     }
-    missing = [name for name, val in required.items() if not val]
+    missing = [n for n,v in required.items() if not v]
     if missing:
         msg = f"🚨 Missing environment variables: {', '.join(missing)}"
         await notify_discord(msg)
         print(msg)
-        # stop the app from starting
         sys.exit(1)
-
-    # 2) All good!
     await notify_discord("✅ All environment variables are set correctly! Service is live.")
     print("✅ Env check passed. Service is live.")
 

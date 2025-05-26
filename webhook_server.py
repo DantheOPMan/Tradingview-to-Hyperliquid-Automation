@@ -20,9 +20,8 @@ LEVERAGE             = 5
 
 # CCXT client — note the walletAddress param
 exchange = ccxt.hyperliquid({
-    "apiKey":          HYPE_API_KEY,
-    "secret":          HYPE_API_SECRET,
     "walletAddress":   WALLET_ADDRESS,
+    "secret":          HYPE_API_SECRET,
     "enableRateLimit": True,
 })
 
@@ -97,8 +96,11 @@ async def handle_webhook(req: Request):
     balance   = await exchange.fetch_balance()
     available = balance["free"].get(quote, 0.0)
     if available <= 0:
-        await notify_discord(f"{symbol} {action} {price:.2f}")
-        raise HTTPException(400, "Insufficient balance")
+        # Notify Discord with the actual available balance
+        msg = f"{symbol} {action} {price:.2f} — insufficient balance: {available:.6f} {quote}"
+        await notify_discord(msg)
+        # Return a 400 with the available amount in the detail
+        raise HTTPException(400, f"Insufficient balance: {available:.6f} {quote}")
 
     amount = (available * LEVERAGE) / price
 

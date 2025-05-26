@@ -120,7 +120,7 @@ async def handle_webhook(req: Request):
             f"{symbol} {action} {price:.2f} — "
             f"insufficient USDC: free={usdc['free']:.6f}, hold={usdc['hold']:.6f}"
         )
-        await notify_discord(msg)
+        #await notify_discord(msg)
         raise HTTPException(400, f"Insufficient balance: {usdc['free']:.6f} USDC")
 
     # 6) Compute position size (5× leverage)

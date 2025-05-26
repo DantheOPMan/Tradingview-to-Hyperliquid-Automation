@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-import os, json, sys
+import os, sys, json
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 import ccxt.async_support as ccxt
@@ -9,58 +9,76 @@ import httpx
 
 app = FastAPI()
 
-# Load our envs once
+# ─── Environment Variables ────────────────────────────────────────────────────
 TRADINGVIEW_SECRET   = os.getenv("TRADINGVIEW_SECRET")
-HYPE_API_KEY         = os.getenv("HYPE_API_KEY")
 HYPE_API_SECRET      = os.getenv("HYPE_API_SECRET")
 DISCORD_WEBHOOK_URL  = os.getenv("DISCORD_WEBHOOK_URL")
-WALLET_ADDRESS       = os.getenv("WALLET_ADDRESS")
+WALLET_ADDRESS       = os.getenv("WALLET_ADDRESS")       # your API‐wallet address
 DEFAULT_SYMBOL       = os.getenv("SYMBOL", "BTC/USDC:USDC")
-LEVERAGE             = 5
+LEVERAGE             = int(os.getenv("LEVERAGE", 5))
 
-# CCXT client — note the walletAddress param
+# ─── CCXT Hyperliquid Client ─────────────────────────────────────────────────
 exchange = ccxt.hyperliquid({
-    "walletAddress":   WALLET_ADDRESS,
-    "secret":          HYPE_API_SECRET,
+    "apiKey":        WALLET_ADDRESS,
+    "secret":        HYPE_API_SECRET,
     "enableRateLimit": True,
 })
 
+# ─── Discord Notifier ─────────────────────────────────────────────────────────
 async def notify_discord(content: str):
     if not DISCORD_WEBHOOK_URL:
-        print("⚠️  DISCORD_WEBHOOK_URL not set; skipping Discord notification")
+        print("⚠️  No DISCORD_WEBHOOK_URL; skipping notification")
         return
     async with httpx.AsyncClient() as client:
         await client.post(DISCORD_WEBHOOK_URL, json={"content": content})
 
+# ─── Startup / Env Validation ─────────────────────────────────────────────────
 @app.on_event("startup")
 async def on_startup():
-    # Validate env vars
     required = {
         "TRADINGVIEW_SECRET": TRADINGVIEW_SECRET,
-        "HYPE_API_KEY":       HYPE_API_KEY,
         "HYPE_API_SECRET":    HYPE_API_SECRET,
-        "DISCORD_WEBHOOK_URL":DISCORD_WEBHOOK_URL,
         "WALLET_ADDRESS":     WALLET_ADDRESS,
+        "DISCORD_WEBHOOK_URL":DISCORD_WEBHOOK_URL,
     }
-    missing = [n for n,v in required.items() if not v]
+    missing = [k for k, v in required.items() if not v]
     if missing:
         msg = f"🚨 Missing environment variables: {', '.join(missing)}"
         await notify_discord(msg)
         print(msg)
         sys.exit(1)
-    await notify_discord("✅ All environment variables are set correctly! Service is live.")
-    print("✅ Env check passed. Service is live.")
- 
+    msg = "✅ All environment variables set! Service is live."
+    await notify_discord(msg)
+    print(msg)
+
+# ─── Shutdown Notification ────────────────────────────────────────────────────
 @app.on_event("shutdown")
 async def on_shutdown():
     await notify_discord("🛑 Service is shutting down")
 
+# ─── Global Exception Handler ─────────────────────────────────────────────────
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     msg = f"⚠️ ERROR: {exc}"
     await notify_discord(msg)
     return PlainTextResponse(str(exc), status_code=500)
 
+# ─── Helper: Fetch Perpetual USDC Balances ────────────────────────────────────
+async def get_perp_usdc():
+    params = {
+        "type": "swap",          # perpetual trades
+        "user": WALLET_ADDRESS,  # your API‐wallet address
+    }
+    resp = await exchange.fetch_balance(params)
+    for bal in resp.get("balances", []):
+        if bal["coin"] == "USDC":
+            total = float(bal["total"])
+            hold  = float(bal["hold"])
+            free  = total - hold
+            return {"total": total, "hold": hold, "free": free}
+    return {"total": 0.0, "hold": 0.0, "free": 0.0}
+
+# ─── Main Webhook Endpoint ───────────────────────────────────────────────────
 @app.post("/webhook")
 async def handle_webhook(req: Request):
     data = await req.json()
@@ -70,10 +88,11 @@ async def handle_webhook(req: Request):
     action = data.get("action", "").upper()
     symbol = data.get("symbol", DEFAULT_SYMBOL)
 
-    # fetch price once for notifications
+    # fetch current price for notifications
     ticker = await exchange.fetch_ticker(symbol)
     price  = ticker["last"]
 
+    # ——— Close Positions (FLAT) ——————————————————————————————
     if action == "FLAT":
         positions = await exchange.fetch_positions()
         for pos in positions:
@@ -88,28 +107,30 @@ async def handle_webhook(req: Request):
         await notify_discord(f"{symbol} FLAT {price:.2f}")
         return {"status": "no_position"}
 
+    # ——— Validate Action ————————————————————————————————————
     if action not in ("BUY", "SELL"):
         raise HTTPException(400, f"Unknown action: {action}")
 
-    side = "buy" if action == "BUY" else "sell"
-    quote     = symbol.split("/")[1]
-    balance   = await exchange.fetch_balance()
-    available = balance["free"].get(quote, 0.0)
-    if available <= 0:
-        # Notify Discord with the actual available balance
-        msg = f"{symbol} {action} {price:.2f} — insufficient balance: {available:.6f} {quote}"
+    # ——— Check Available USDC —————————————————————————————
+    usdc = await get_perp_usdc()
+    if usdc["free"] <= 0:
+        msg = (
+            f"{symbol} {action} {price:.2f} — "
+            f"insufficient USDC: free={usdc['free']:.6f}, hold={usdc['hold']:.6f}"
+        )
         await notify_discord(msg)
-        # Return a 400 with the available amount in the detail
-        raise HTTPException(400, f"Insufficient balance: {available:.6f} {quote}")
+        raise HTTPException(400, f"Insufficient balance: {usdc['free']:.6f} USDC")
 
-    amount = (available * LEVERAGE) / price
+    # ——— Place Market Order at 5× Leverage ——————————————————————
+    side   = "buy" if action == "BUY" else "sell"
+    amount = (usdc["free"] * LEVERAGE) / price
 
     try:
         order = await exchange.create_order(
-            symbol, "market", side, amount, None, {"leverage": LEVERAGE}
+            symbol, "market", side, amount, None, {"leverage": LEVERAGE+1}
         )
     except Exception as e:
-        await notify_discord(f"{symbol} {action} {price:.2f}")
+        await notify_discord(f"{symbol} {action} {price:.2f} — failed: {e}")
         raise HTTPException(500, f"Order failed: {e}")
 
     await notify_discord(f"{symbol} {action} {price:.2f}")

@@ -50,7 +50,7 @@ async def on_startup():
         sys.exit(1)
     await notify_discord("✅ All environment variables are set correctly! Service is live.")
     print("✅ Env check passed. Service is live.")
-
+ 
 @app.on_event("shutdown")
 async def on_shutdown():
     await notify_discord("🛑 Service is shutting down")

@@ -21,7 +21,7 @@ LEVERAGE            = int(os.getenv("LEVERAGE", 5))
 
 # ─── CCXT Hyperliquid Client ─────────────────────────────────────────────────
 exchange = ccxt.hyperliquid({
-    "apiKey":          WALLET_ADDRESS,
+    "account_address": WALLET_ADDRESS,
     "secret":          HYPE_API_SECRET,
     "enableRateLimit": True,
 })

@@ -34,7 +34,7 @@ exchange = ccxt.hyperliquid({
     "privateKey":    HYPE_API_SECRET,
     "enableRateLimit": True,
 })
-
+ 
 # ─── Discord Notifier ───────────────────────────────────────────────────────
 async def notify_discord(content: str) -> None:
     if not DISCORD_WEBHOOK_URL:

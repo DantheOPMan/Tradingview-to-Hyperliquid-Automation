@@ -144,24 +144,25 @@ async def handle_webhook(request: Request):
         await notify_discord(f"{symbol} FETCH_TICKER_FAILED: {e}")
         raise HTTPException(502, f"Price fetch error: {e}")
 
-    # 4) Handle FLAT
+    # 4) Handle FLAT (This remains the same for explicit closes)
     if action == "FLAT":
         try:
-            positions = await exchange.fetch_positions()
-            for pos in positions or []:
-                if pos.get("symbol") != symbol:
-                    continue
-                size = float(pos.get("info", {}).get("position", {}).get("szi") or 0)
-                if size == 0:
-                    continue
-                amt = abs(size)
-                close_side = "sell" if size > 0 else "buy"
-                order = await exchange.create_order(
-                    symbol, "market", close_side, amt, price,
-                    {"leverage": LEVERAGE, "reduceOnly": True},
-                )
-                await notify_discord(f"{symbol} FLAT {price:.2f}")
-                return {"status": "closed", "order": order}
+            positions = await exchange.fetch_positions([symbol])
+            if positions:
+                for pos in positions:
+                    if pos.get("symbol") != symbol:
+                        continue
+                    size = float(pos.get("info", {}).get("position", {}).get("szi") or 0)
+                    if size == 0:
+                        continue
+                    amt = abs(size)
+                    close_side = "sell" if size > 0 else "buy"
+                    order = await exchange.create_order(
+                        symbol, "market", close_side, amt, price,
+                        {"leverage": LEVERAGE, "reduceOnly": True},
+                    )
+                    await notify_discord(f"{symbol} FLAT {price:.2f}")
+                    return {"status": "closed", "order": order}
         except Exception as e:
             logger.error(f"Error closing position on {symbol}: {e}")
             await notify_discord(f"{symbol} FLAT_FAILED: {e}")
@@ -175,7 +176,37 @@ async def handle_webhook(request: Request):
         logger.warning(f"Unknown action received: {action}")
         raise HTTPException(400, f"Unknown action: {action}")
 
-    # 6) Check balance
+    # NEW: 6) Proactively close any opposing position before entering
+    try:
+        positions = await exchange.fetch_positions([symbol])
+        if positions:
+            for pos in positions:
+                if pos.get("symbol") != symbol:
+                    continue
+                
+                current_size = float(pos.get('info', {}).get('position', {}).get('szi', 0))
+                
+                # If we want to BUY but have a SHORT position, or want to SELL and have a LONG position
+                if (action == "BUY" and current_size < 0) or (action == "SELL" and current_size > 0):
+                    logger.info(f"Closing opposing position for {symbol} before new entry.")
+                    amt = abs(current_size)
+                    close_side = "buy" if current_size < 0 else "sell"
+                    await exchange.create_order(
+                        symbol, "market", close_side, amt, price,
+                        {"leverage": LEVERAGE, "reduceOnly": True}
+                    )
+                    await notify_discord(f"{symbol} Closed opposing position at {price:.2f}")
+                    # Give a moment for the exchange to process the close
+                    await asyncio.sleep(2) 
+
+    except Exception as e:
+        logger.error(f"Failed to close opposing position for {symbol}: {e}")
+        await notify_discord(f"{symbol} CLOSE_OPPOSING_FAILED: {e}")
+        # Depending on your risk tolerance, you might want to stop here
+        raise HTTPException(500, f"Closing opposing position failed: {e}")
+
+
+    # 7) Check balance
     usdc = await get_perp_usdc()
     if usdc["free"] <= 0:
         msg = (
@@ -185,7 +216,7 @@ async def handle_webhook(request: Request):
         logger.warning(msg)
         raise HTTPException(400, msg)
 
-    # 7) Compute size & send order
+    # 8) Compute size & send order
     side   = "buy" if action == "BUY" else "sell"
     amount = (usdc["free"] * LEVERAGE) / price if price > 0 else 0
 
@@ -198,7 +229,7 @@ async def handle_webhook(request: Request):
         await notify_discord(f"{symbol} {action} {price:.2f} — FAILED: {e}")
         raise HTTPException(500, f"Order failed: {e}")
 
-    # 8) Success
+    # 9) Success
     logger.info(f"Order placed: {symbol} {action} {amount:.6f}@{price:.2f}")
     await notify_discord(f"{symbol} {action} {price:.2f}")
     return {"status": "ok", "action": action, "order": order}

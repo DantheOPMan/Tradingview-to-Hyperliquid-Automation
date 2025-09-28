@@ -24,7 +24,7 @@ logger = logging.getLogger("tradingbot")
 TRADINGVIEW_SECRET  = os.getenv("TRADINGVIEW_SECRET")
 HYPE_API_SECRET     = os.getenv("HYPE_API_SECRET")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-WALLET_ADDRESS      = os.getenv("WALLET_ADDRESS")
+WALLET_ADDRESS      = os.getenv("WALLET_ADDRESS")           # your API-wallet address
 DEFAULT_SYMBOL      = os.getenv("SYMBOL", "BTC/USDC:USDC")
 LEVERAGE            = int(os.getenv("LEVERAGE", 5))
 
@@ -34,14 +34,14 @@ exchange = ccxt.hyperliquid({
     "privateKey":    HYPE_API_SECRET,
     "enableRateLimit": True,
 })
-
+ 
 # ─── Discord Notifier ───────────────────────────────────────────────────────
 async def notify_discord(content: str) -> None:
     if not DISCORD_WEBHOOK_URL:
         logger.warning("No DISCORD_WEBHOOK_URL; skipping notification")
         return
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(DISCORD_WEBHOOK_URL, json={"content": content})
             resp.raise_for_status()
     except Exception as e:
@@ -62,6 +62,7 @@ async def on_startup():
         msg = f"🚨 Missing environment variables: {', '.join(k[0] for k in missing)}"
         logger.critical(msg)
         await notify_discord(msg)
+        # Give Discord up to 3 seconds, then exit
         await asyncio.sleep(3)
         sys.exit(1)
 
@@ -73,6 +74,8 @@ async def on_startup():
 async def on_shutdown():
     try:
         await notify_discord("🛑 Service is shutting down")
+    except Exception:
+        pass
     finally:
         try:
             await exchange.close()
@@ -90,20 +93,31 @@ async def global_exception_handler(request: Request, exc: Exception):
 async def get_perp_usdc() -> Dict[str, float]:
     try:
         resp = await exchange.fetch_balance()
-        usdc_balance = resp.get("USDC", {})
-        total = float(usdc_balance.get("total", 0.0))
-        free  = float(usdc_balance.get("free", 0.0))
-        used  = float(usdc_balance.get("used", 0.0))
-        return {"total": total, "hold": used, "free": free}
-    except (Exception, ValueError, TypeError) as e:
-        logger.error(f"fetch_balance failed or returned invalid data: {e}")
+    except Exception as e:
+        logger.error(f"fetch_balance failed: {e}")
         raise HTTPException(502, f"Balance fetch error: {e}")
 
+    # Try both CCXT styles safely
+    total = resp.get("USDC", {}).get("total") or resp.get("total", {}).get("USDC")
+    free  = resp.get("USDC", {}).get("free")  or resp.get("free",  {}).get("USDC")
+    used  = resp.get("USDC", {}).get("used")  or resp.get("used",  {}).get("USDC")
+
+    # Fallback to zeros if anything missing
+    try:
+        total = float(total or 0.0)
+        free  = float(free  or 0.0)
+        used  = float(used  or 0.0)
+    except (ValueError, TypeError):
+        logger.warning("Balance response contained non-numeric values; defaulting to 0")
+        total = free = used = 0.0
+
+    hold = used
+    return {"total": total, "hold": hold, "free": free}
 
 # ─── Main Webhook Endpoint ───────────────────────────────────────────────────
 @app.post("/webhook")
 async def handle_webhook(request: Request):
-    # 1) Parse & Validate JSON
+    # 1) Parse & validate JSON
     try:
         data = await request.json()
         if not isinstance(data, dict):
@@ -121,100 +135,101 @@ async def handle_webhook(request: Request):
     symbol = str(data.get("symbol", DEFAULT_SYMBOL)).strip()
     logger.info(f"Received webhook: action={action}, symbol={symbol}")
 
-    # 3) Fetch current positions FIRST to get a clear state
-    current_size = 0.0
+    # 3) Fetch price safely
     try:
-        positions = await exchange.fetch_positions([symbol])
-        if positions:
-            # Find the specific position for our symbol
-            pos = next((p for p in positions if p.get("symbol") == symbol), None)
-            if pos and pos.get('info', {}).get('position'):
-                # Safely get the size ('szi')
-                current_size = float(pos['info']['position'].get('szi', 0.0))
+        ticker = await exchange.fetch_ticker(symbol)
+        price  = float(ticker.get("last") or 0.0)
     except Exception as e:
-        logger.error(f"Failed to fetch positions for {symbol}: {e}")
-        await notify_discord(f"🚨 {symbol} FETCH_POSITIONS_FAILED: {e}")
-        raise HTTPException(502, f"Position fetch error: {e}")
+        logger.error(f"Failed to fetch ticker for {symbol}: {e}")
+        await notify_discord(f"{symbol} FETCH_TICKER_FAILED: {e}")
+        raise HTTPException(502, f"Price fetch error: {e}")
 
-    # 4) Handle FLAT (Close any existing position)
+    # 4) Handle FLAT (This remains the same for explicit closes)
     if action == "FLAT":
-        if current_size != 0:
-            try:
-                side = "sell" if current_size > 0 else "buy"
-                amount = abs(current_size)
-                logger.info(f"Executing FLAT command for {symbol}. Side: {side}, Amount: {amount}")
-                order = await exchange.create_order(
-                    symbol, "market", side, amount, params={"reduceOnly": True}
-                )
-                await notify_discord(f"✅ {symbol} FLAT command executed.")
-                return {"status": "closed", "order": order}
-            except Exception as e:
-                logger.error(f"Error on FLAT for {symbol}: {e}")
-                await notify_discord(f"🚨 {symbol} FLAT_FAILED: {e}")
-                # Do not re-raise; allow logic to continue if needed, but log it
-        else:
-            logger.info(f"Received FLAT for {symbol}, but no position was open.")
-            await notify_discord(f"ℹ️ {symbol} FLAT (no active position).")
-        return {"status": "no_position_to_flat"}
+        try:
+            positions = await exchange.fetch_positions([symbol])
+            if positions:
+                for pos in positions:
+                    if pos.get("symbol") != symbol:
+                        continue
+                    size = float(pos.get("info", {}).get("position", {}).get("szi") or 0)
+                    if size == 0:
+                        continue
+                    amt = abs(size)
+                    close_side = "sell" if size > 0 else "buy"
+                    order = await exchange.create_order(
+                        symbol, "market", close_side, amt, price,
+                        {"leverage": LEVERAGE, "reduceOnly": True},
+                    )
+                    await notify_discord(f"{symbol} FLAT {price:.2f}")
+                    return {"status": "closed", "order": order}
+        except Exception as e:
+            logger.error(f"Error closing position on {symbol}: {e}")
+            await notify_discord(f"{symbol} FLAT_FAILED: {e}")
+            raise HTTPException(500, f"Closing position failed: {e}")
 
-    # 5) Validate action for new entries
+        await notify_discord(f"{symbol} FLAT (no active position) {price:.2f}")
+        return {"status": "no_position"}
+
+    # 5) Validate action
     if action not in ("BUY", "SELL"):
         logger.warning(f"Unknown action received: {action}")
         raise HTTPException(400, f"Unknown action: {action}")
 
-    # 6) Proactively close any opposing position before entering a new one
-    is_entering_long = action == "BUY"
-    is_entering_short = action == "SELL"
-    
-    if (is_entering_long and current_size < 0) or (is_entering_short and current_size > 0):
-        try:
-            side = "buy" if current_size < 0 else "sell"
-            amount = abs(current_size)
-            logger.info(f"Closing opposing {('SHORT' if current_size < 0 else 'LONG')} position for {symbol}.")
-            await exchange.create_order(
-                symbol, "market", side, amount, params={"reduceOnly": True}
-            )
-            await notify_discord(f"✅ {symbol} Closed opposing position before new entry.")
-            # CRITICAL: Wait for the exchange to process the close
-            await asyncio.sleep(5)
-        except Exception as e:
-            logger.error(f"Failed to close opposing position for {symbol}: {e}")
-            await notify_discord(f"🚨 {symbol} CLOSE_OPPOSING_FAILED: {e}")
-            raise HTTPException(500, f"Closing opposing position failed: {e}")
-
-    # 7) Fetch latest price
+    # NEW: 6) Proactively close any opposing position before entering
     try:
-        ticker = await exchange.fetch_ticker(symbol)
-        price = float(ticker.get("last", 0.0))
-        if price <= 0:
-            raise ValueError("Price is zero or invalid")
-    except Exception as e:
-        logger.error(f"Failed to fetch ticker for {symbol}: {e}")
-        await notify_discord(f"🚨 {symbol} FETCH_TICKER_FAILED: {e}")
-        raise HTTPException(502, f"Price fetch error: {e}")
+        positions = await exchange.fetch_positions([symbol])
+        if positions:
+            for pos in positions:
+                if pos.get("symbol") != symbol:
+                    continue
+                
+                current_size = float(pos.get('info', {}).get('position', {}).get('szi', 0))
+                
+                # If we want to BUY but have a SHORT position, or want to SELL and have a LONG position
+                if (action == "BUY" and current_size < 0) or (action == "SELL" and current_size > 0):
+                    logger.info(f"Closing opposing position for {symbol} before new entry.")
+                    amt = abs(current_size)
+                    close_side = "buy" if current_size < 0 else "sell"
+                    await exchange.create_order(
+                        symbol, "market", close_side, amt, price,
+                        {"leverage": LEVERAGE, "reduceOnly": True}
+                    )
+                    await notify_discord(f"{symbol} Closed opposing position at {price:.2f}")
+                    # Give a moment for the exchange to process the close
+                    await asyncio.sleep(2) 
 
-    # 8) Check balance and compute size
+    except Exception as e:
+        logger.error(f"Failed to close opposing position for {symbol}: {e}")
+        await notify_discord(f"{symbol} CLOSE_OPPOSING_FAILED: {e}")
+        # Depending on your risk tolerance, you might want to stop here
+        raise HTTPException(500, f"Closing opposing position failed: {e}")
+
+
+    # 7) Check balance
     usdc = await get_perp_usdc()
-    if usdc["free"] < 1.0: # Using a small buffer
-        msg = f"{symbol} {action} {price:.2f} — Insufficient USDC: free={usdc['free']:.2f}"
+    if usdc["free"] <= 0:
+        msg = (
+            f"{symbol} {action} {price:.2f} — "
+            f"insufficient USDC: free={usdc['free']:.6f}, hold={usdc['hold']:.6f}"
+        )
         logger.warning(msg)
         raise HTTPException(400, msg)
 
-    side = "buy" if action == "BUY" else "sell"
-    amount = (usdc["free"] * LEVERAGE) / price
+    # 8) Compute size & send order
+    side   = "buy" if action == "BUY" else "sell"
+    amount = (usdc["free"] * LEVERAGE) / price if price > 0 else 0
 
-    # 9) Send order
     try:
-        logger.info(f"Placing new order: {symbol} {action} {amount:.6f} @ {price:.2f}")
         order = await exchange.create_order(
-            symbol, "market", side, amount, params={"leverage": LEVERAGE}
+            symbol, "market", side, amount, price, {"leverage": LEVERAGE}
         )
     except Exception as e:
         logger.error(f"Order failed: {e}")
-        await notify_discord(f"🚨 {symbol} {action} FAILED: {e}")
+        await notify_discord(f"{symbol} {action} {price:.2f} — FAILED: {e}")
         raise HTTPException(500, f"Order failed: {e}")
 
-    # 10) Success
-    logger.info(f"Order placed successfully: {order}")
-    await notify_discord(f"✅ {symbol} {action} order placed at ~{price:.2f}")
+    # 9) Success
+    logger.info(f"Order placed: {symbol} {action} {amount:.6f}@{price:.2f}")
+    await notify_discord(f"{symbol} {action} {price:.2f}")
     return {"status": "ok", "action": action, "order": order}

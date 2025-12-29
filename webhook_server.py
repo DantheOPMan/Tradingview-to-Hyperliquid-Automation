@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 import ccxt.async_support as ccxt
 import httpx
 
+# ─── Configuration & Logging ────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -21,6 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tradingbot")
 
+# ─── Environment Variables ──────────────────────────────────────────────────
 TRADINGVIEW_SECRET  = os.getenv("TRADINGVIEW_SECRET")
 HYPE_API_SECRET     = os.getenv("HYPE_API_SECRET")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
@@ -28,20 +30,25 @@ WALLET_ADDRESS      = os.getenv("WALLET_ADDRESS")
 DEFAULT_SYMBOL      = os.getenv("SYMBOL", "BTC/USDC:USDC")
 LEVERAGE            = int(os.getenv("LEVERAGE", 5))
 
+# Buffer time to catch split signals (e.g. Flat + Buy)
 SIGNAL_BUFFER_SECONDS = 7 
 
+# ─── Global State ───────────────────────────────────────────────────────────
 exchange: Optional[ccxt.hyperliquid] = None
 TRADE_LOCK = asyncio.Lock()
 
+# Signal Buffer State
 pending_actions: Dict[str, Set[str]] = defaultdict(set)
 active_timers: Set[str] = set()
 
+# ─── Pydantic Models ────────────────────────────────────────────────────────
 class WebhookPayload(BaseModel):
     secret: str
     action: str
     symbol: str = Field(default=DEFAULT_SYMBOL)
     leverage: Optional[int] = None
 
+# ─── Discord Notifier ───────────────────────────────────────────────────────
 async def notify_discord(content: str) -> None:
     if not DISCORD_WEBHOOK_URL:
         return
@@ -52,6 +59,7 @@ async def notify_discord(content: str) -> None:
     except Exception as e:
         logger.error(f"Failed to send Discord notification: {e}")
 
+# ─── Helper: Fetch Perpetual USDC Balances ──────────────────────────────────
 async def get_perp_usdc() -> Dict[str, float]:
     try:
         resp = await exchange.fetch_balance()
@@ -72,6 +80,7 @@ async def get_perp_usdc() -> Dict[str, float]:
 
     return {"total": total, "hold": used, "free": free}
 
+# ─── Helper: Close Position ─────────────────────────────────────────────────
 async def close_position(symbol: str, price: float) -> bool:
     try:
         positions = await exchange.fetch_positions()
@@ -101,12 +110,14 @@ async def close_position(symbol: str, price: float) -> bool:
     
     return False
 
+# ─── Core Trade Logic ───────────────────────────────────────────────────────
 async def execute_trade_logic(symbol: str, action: str):
     action = action.upper()
     
     async with TRADE_LOCK:
         logger.info(f"Executing Decision for {symbol}: {action}")
 
+        # 1) Fetch price
         try:
             ticker = await exchange.fetch_ticker(symbol)
             price  = float(ticker.get("last") or 0.0)
@@ -115,12 +126,14 @@ async def execute_trade_logic(symbol: str, action: str):
             await notify_discord(f"{symbol} FETCH_TICKER_FAILED: {e}")
             return
 
+        # 2) Handle FLAT
         if action == "FLAT":
             closed = await close_position(symbol, price)
             if not closed:
                 await notify_discord(f"{symbol} FLAT received but no active position.")
             return
 
+        # 3) Handle BUY/SELL (Flip Check)
         try:
             positions = await exchange.fetch_positions()
             current_pos = next((p for p in positions or [] if p.get("symbol") == symbol), None)
@@ -140,6 +153,7 @@ async def execute_trade_logic(symbol: str, action: str):
              await notify_discord(f"{symbol} Position Check Error: {e}")
              return
 
+        # 4) Check balance
         usdc = await get_perp_usdc()
         if usdc["free"] <= 0:
             msg = f"{symbol} {action} {price:.2f} — Insufficient USDC"
@@ -147,6 +161,7 @@ async def execute_trade_logic(symbol: str, action: str):
             await notify_discord(msg)
             return
 
+        # 5) Compute size & send order
         side   = "buy" if action == "BUY" else "sell"
         amount = (usdc["free"] * 0.99 * LEVERAGE) / price if price > 0 else 0
 
@@ -160,6 +175,7 @@ async def execute_trade_logic(symbol: str, action: str):
             logger.error(f"Order failed: {e}")
             await notify_discord(f"{symbol} {action} {price:.2f} — FAILED: {e}")
 
+# ─── Buffer Processing Task ─────────────────────────────────────────────────
 async def process_buffered_signals(symbol: str):
     logger.info(f"Buffering signals for {symbol} ({SIGNAL_BUFFER_SECONDS}s)...")
     await asyncio.sleep(SIGNAL_BUFFER_SECONDS)
@@ -185,6 +201,28 @@ async def process_buffered_signals(symbol: str):
     else:
         logger.warning(f"No valid actions in: {signals}")
 
+# ─── Background Health Check ────────────────────────────────────────────────
+async def daily_health_check_loop():
+    """
+    Runs every 24 hours. Checks connection.
+    - If Success: Logs to console only.
+    - If Failed: Logs to console AND sends Discord Alert.
+    """
+    while True:
+        # Wait 24 hours (86400 seconds)
+        await asyncio.sleep(86400)
+        
+        logger.info("Running daily wallet health check...")
+        try:
+            # Verify read-access by fetching balance (result ignored)
+            await exchange.fetch_balance()
+            logger.info("✅ Daily health check passed.")
+        except Exception as e:
+            msg = f"⚠️ DAILY HEALTH CHECK FAILED: {e}. Check API Keys or Exchange Status."
+            logger.critical(msg)
+            await notify_discord(msg)
+
+# ─── Lifespan & App ─────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global exchange
@@ -208,6 +246,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Env vars loaded.")
 
+    # 1. Immediate Startup Check
     try:
         logger.info("Testing wallet connection...")
         await exchange.fetch_balance()
@@ -217,10 +256,12 @@ async def lifespan(app: FastAPI):
         logger.critical(f"❌ Wallet connection FAILED: {e}")
         await notify_discord(f"❌ Wallet connection FAILED: {e}")
     
+    # 2. Start Daily Check Loop (Runs in background)
+    asyncio.create_task(daily_health_check_loop())
+
     yield
     
     try:
-        await notify_discord("🛑 Service is shutting down")
         if exchange:
             await exchange.close()
     except Exception:
@@ -228,6 +269,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# ─── Main Webhook Endpoint ───────────────────────────────────────────────────
 @app.post("/webhook")
 async def handle_webhook(payload: WebhookPayload):
     if payload.secret != TRADINGVIEW_SECRET:
@@ -241,6 +283,7 @@ async def handle_webhook(payload: WebhookPayload):
 
     logger.info(f"Received: {symbol} -> {raw_action}")
 
+    # Add to buffer and start timer
     pending_actions[symbol].add(raw_action)
 
     if symbol not in active_timers:

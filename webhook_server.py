@@ -21,6 +21,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("tradingbot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ─── Environment Variables ──────────────────────────────────────────────────
 TRADINGVIEW_SECRET  = os.getenv("TRADINGVIEW_SECRET")
@@ -29,6 +30,17 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 WALLET_ADDRESS      = os.getenv("WALLET_ADDRESS")
 DEFAULT_SYMBOL      = os.getenv("SYMBOL", "BTC/USDC:USDC")
 LEVERAGE            = int(os.getenv("LEVERAGE", 5))
+
+def build_hyperliquid_config(wallet_address: Optional[str], private_key: Optional[str]) -> Dict[str, object]:
+    return {
+        "walletAddress": wallet_address,
+        "privateKey": private_key,
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "swap",
+            "fetchMarkets": {"types": ["swap"]},
+        },
+    }
 
 # Buffer time to catch split signals (e.g. Flat + Buy)
 SIGNAL_BUFFER_SECONDS = 7 
@@ -119,10 +131,10 @@ async def execute_trade_logic(symbol: str, action: str):
 
         # 1) Fetch price
         try:
-            ticker = await exchange.fetch_ticker(symbol)
+            ticker = await exchange.fetch_ticker(symbol, {"type": "swap"})
             price  = float(ticker.get("last") or 0.0)
         except Exception as e:
-            logger.error(f"Failed to fetch ticker: {e}")
+            logger.exception(f"Failed to fetch ticker for {symbol}")
             await notify_discord(f"{symbol} FETCH_TICKER_FAILED: {e}")
             return
 
@@ -226,11 +238,7 @@ async def daily_health_check_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global exchange
-    exchange = ccxt.hyperliquid({
-        "walletAddress": WALLET_ADDRESS,
-        "privateKey":    HYPE_API_SECRET,
-        "enableRateLimit": True,
-    })
+    exchange = ccxt.hyperliquid(build_hyperliquid_config(WALLET_ADDRESS, HYPE_API_SECRET))
     
     missing = [k for k in (
         ("TRADINGVIEW_SECRET", TRADINGVIEW_SECRET),

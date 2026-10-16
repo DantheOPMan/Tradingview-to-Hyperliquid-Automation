@@ -5,6 +5,7 @@ import os
 import sys
 import logging
 import asyncio
+import random
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Set
 from collections import defaultdict
@@ -44,10 +45,12 @@ def build_hyperliquid_config(wallet_address: Optional[str], private_key: Optiona
 
 # Buffer time to catch split signals (e.g. Flat + Buy)
 SIGNAL_BUFFER_SECONDS = 7 
+RATE_LIMIT_RETRY_DELAYS = (10, 20, 40)
 
 # ─── Global State ───────────────────────────────────────────────────────────
 exchange: Optional[ccxt.hyperliquid] = None
 TRADE_LOCK = asyncio.Lock()
+EXCHANGE_READ_LOCK = asyncio.Lock()
 
 # Signal Buffer State
 pending_actions: Dict[str, Set[str]] = defaultdict(set)
@@ -71,13 +74,28 @@ async def notify_discord(content: str) -> None:
     except Exception as e:
         logger.error(f"Failed to send Discord notification: {e}")
 
+# ─── Helper: Retry Rate-Limited Reads ───────────────────────────────────────
+async def read_exchange(method, *args, **kwargs):
+    """Retry read requests only; order submissions must never be replayed here."""
+    # Hold the lock during backoff so health checks and trades share the pause.
+    async with EXCHANGE_READ_LOCK:
+        for attempt in range(len(RATE_LIMIT_RETRY_DELAYS) + 1):
+            try:
+                return await method(*args, **kwargs)
+            except ccxt.RateLimitExceeded:
+                if attempt == len(RATE_LIMIT_RETRY_DELAYS):
+                    raise
+                delay = RATE_LIMIT_RETRY_DELAYS[attempt] + random.uniform(0, 1)
+                logger.warning(
+                    "Hyperliquid rate limited %s; retry %s/%s in %.1fs",
+                    getattr(method, "__name__", "read"),
+                    attempt + 1, len(RATE_LIMIT_RETRY_DELAYS), delay,
+                )
+                await asyncio.sleep(delay)
+
 # ─── Helper: Fetch Perpetual USDC Balances ──────────────────────────────────
 async def get_perp_usdc() -> Dict[str, float]:
-    try:
-        resp = await exchange.fetch_balance()
-    except Exception as e:
-        logger.error(f"fetch_balance failed: {e}")
-        return {"total": 0.0, "hold": 0.0, "free": 0.0}
+    resp = await read_exchange(exchange.fetch_balance)
 
     total = resp.get("USDC", {}).get("total") or resp.get("total", {}).get("USDC")
     free  = resp.get("USDC", {}).get("free")  or resp.get("free",  {}).get("USDC")
@@ -93,9 +111,14 @@ async def get_perp_usdc() -> Dict[str, float]:
     return {"total": total, "hold": used, "free": free}
 
 # ─── Helper: Close Position ─────────────────────────────────────────────────
-async def close_position(symbol: str, price: float) -> bool:
+async def close_position(symbol: str, positions=None) -> Optional[bool]:
+    """Return True when closed, False when absent, and None on failure."""
     try:
-        positions = await exchange.fetch_positions()
+        if positions is None:
+            positions = await read_exchange(exchange.fetch_positions)
+        # Obtain the quote after any position-read backoff.
+        ticker = await read_exchange(exchange.fetch_ticker, symbol, {"type": "swap"})
+        price = float(ticker.get("last") or 0.0)
         for pos in positions or []:
             if pos.get("symbol") != symbol:
                 continue
@@ -118,7 +141,7 @@ async def close_position(symbol: str, price: float) -> bool:
     except Exception as e:
         logger.error(f"Error closing position on {symbol}: {e}")
         await notify_discord(f"{symbol} CLOSE_FAILED: {e}")
-        return False
+        return None
     
     return False
 
@@ -129,25 +152,16 @@ async def execute_trade_logic(symbol: str, action: str):
     async with TRADE_LOCK:
         logger.info(f"Executing Decision for {symbol}: {action}")
 
-        # 1) Fetch price
-        try:
-            ticker = await exchange.fetch_ticker(symbol, {"type": "swap"})
-            price  = float(ticker.get("last") or 0.0)
-        except Exception as e:
-            logger.exception(f"Failed to fetch ticker for {symbol}")
-            await notify_discord(f"{symbol} FETCH_TICKER_FAILED: {e}")
-            return
-
-        # 2) Handle FLAT
+        # 1) Handle FLAT
         if action == "FLAT":
-            closed = await close_position(symbol, price)
-            if not closed:
+            closed = await close_position(symbol)
+            if closed is False:
                 await notify_discord(f"{symbol} FLAT received but no active position.")
             return
 
-        # 3) Handle BUY/SELL (Flip Check)
+        # 2) Handle BUY/SELL (Flip Check)
         try:
-            positions = await exchange.fetch_positions()
+            positions = await read_exchange(exchange.fetch_positions)
             current_pos = next((p for p in positions or [] if p.get("symbol") == symbol), None)
             
             if current_pos:
@@ -158,15 +172,31 @@ async def execute_trade_logic(symbol: str, action: str):
                     
                     if current_side != target_side:
                         logger.info(f"Flipping {symbol} from {current_side} to {target_side}")
-                        await close_position(symbol, price)
+                        if not await close_position(symbol, positions=positions):
+                            return
                         await asyncio.sleep(0.5) 
         except Exception as e:
              logger.error(f"Error checking positions: {e}")
              await notify_discord(f"{symbol} Position Check Error: {e}")
              return
 
-        # 4) Check balance
-        usdc = await get_perp_usdc()
+        # 3) Check balance; a failed read is not a zero balance.
+        try:
+            usdc = await get_perp_usdc()
+        except Exception as e:
+            logger.error(f"Error checking balance: {e}")
+            await notify_discord(f"{symbol} BALANCE_CHECK_FAILED: {e}")
+            return
+
+        # 4) Fetch a fresh price after any position/balance retry delays.
+        try:
+            ticker = await read_exchange(exchange.fetch_ticker, symbol, {"type": "swap"})
+            price = float(ticker.get("last") or 0.0)
+        except Exception as e:
+            logger.exception(f"Failed to fetch ticker for {symbol}")
+            await notify_discord(f"{symbol} FETCH_TICKER_FAILED: {e}")
+            return
+
         if usdc["free"] <= 0:
             msg = f"{symbol} {action} {price:.2f} — Insufficient USDC"
             logger.warning(msg)
@@ -227,7 +257,7 @@ async def daily_health_check_loop():
         logger.info("Running daily wallet health check...")
         try:
             # Verify read-access by fetching balance (result ignored)
-            await exchange.fetch_balance()
+            await read_exchange(exchange.fetch_balance)
             logger.info("✅ Daily health check passed.")
         except Exception as e:
             msg = f"⚠️ DAILY HEALTH CHECK FAILED: {e}. Check API Keys or Exchange Status."
@@ -257,7 +287,7 @@ async def lifespan(app: FastAPI):
     # 1. Immediate Startup Check
     try:
         logger.info("Testing wallet connection...")
-        await exchange.fetch_balance()
+        await read_exchange(exchange.fetch_balance)
         logger.info("✅ Wallet connection confirmed!")
         await notify_discord("✅ Wallet connection confirmed! Service is ready.")
     except Exception as e:

@@ -175,6 +175,26 @@ Key components:
 * **Railway Logs**: View live logs in the Railway dashboard under your service.
 * **Discord Alerts**: Receive immediate notifications for critical events and errors.
 
+### Hyperliquid rate limits (HTTP 429)
+
+The bot keeps CCXT's rate limiter enabled and retries rate-limited position,
+balance, and ticker reads up to three times, waiting 10, 20, then 40 seconds
+(plus up to one second of jitter per retry). Startup and daily checks use the
+same retry handling. Reads within this process share the backoff pause.
+
+If a read still fails, the current action stops and reports the error. An order
+submission is never automatically retried, and a failed close stops a side
+switch. Position data is reused for the close within the same decision, and
+prices are fetched after read delays before submitting orders.
+
+Hyperliquid's REST limits are shared per IP address. Multiple workers, replicas,
+or services sharing an outbound IP can still exhaust that limit; CCXT's limiter
+and this retry lock only coordinate one process. If 429s persist, check Railway
+replica/worker counts and other traffic using the same outbound IP. See the
+[Hyperliquid rate-limit documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits).
+
+Run the offline regression suite with `python -m unittest discover -s tests -v`.
+
 ---
 
 ## Contributing

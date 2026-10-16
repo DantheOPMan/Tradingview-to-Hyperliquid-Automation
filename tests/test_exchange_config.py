@@ -39,6 +39,7 @@ def install_import_stubs():
     ccxt.hyperliquid = object
     async_support = types.ModuleType("ccxt.async_support")
     async_support.hyperliquid = object
+    async_support.RateLimitExceeded = type("RateLimitExceeded", (Exception,), {})
     ccxt.async_support = async_support
     sys.modules["ccxt"] = ccxt
     sys.modules["ccxt.async_support"] = async_support
